@@ -47,6 +47,13 @@ class Polymer:
         self.atoms = self.polymer.atoms
         self.dimensions = self.polymer.dimensions
 
+        # PCA cache attributes
+        self._pca_valid = False
+
+        # TODO store standard dummy atom names as part of the polymer?
+        # This is easier to use, but possibly less flexible
+        # It might be better to have add some kind of is_dummy metadata element to an atom
+ 
     def select_atoms(self, selection) -> mda.AtomGroup:
         """
         Selection method that selects atoms from the polymer's MDAnalysis
@@ -88,6 +95,8 @@ class Polymer:
                     atom name defined by namein, defaults to 'X'
         :type nameout: str, optional
         """
+        self.invalidate_pca_cache() # do I need to do this?  currently forcing it, but I need to consider this when I refactor dummy handling
+
         i = len(self.polymer.select_atoms(f"resid {resid} and name {nameout}*").atoms.names) + 1 # count existing dummy atoms
         dummies=self.polymer.select_atoms(f"resid {resid} and name {namein}")
         for x in dummies.atoms.indices:
@@ -192,6 +201,7 @@ class Polymer:
             any dummy atoms.
 
         """
+        self.invalidate_pca_cache()
 
         Q = self.polymer.select_atoms(f"resid {n} and name {names['Q']}").positions[-1]
         S = self.polymer.select_atoms(f"resid {n} and name {names['S']}").positions[-1]
@@ -249,7 +259,7 @@ class Polymer:
         new.dimensions = list(new.atoms.positions.max(axis=0) + [0.5,0.5,0.5]) + [90]*3
         self.polymer = new.copy()
     
-    def _split_pol(self,J,J_resid,K,K_resid):
+    def _split_pol(self,J,J_resid,K,K_resid,stator_selection=None):
         """
         Given a pair of bonded atoms, uses a graph representation to identify groups of connected atoms on either side of the bond returns atomgroups corresponding to all atoms on either side of the bond.
         
@@ -260,10 +270,14 @@ class Polymer:
             J_resid:       the resid of the first atom in the bond
             K (atom name): the name of the second atom in the bond
             K_resid:       the resid of the second atom in the bond
+            stator_selection: used to distinguish between output atomgroups; eg if you want to rotate around a dihedral care which half of the polymer moves and which half stays fixed; TODO fix how this is written
 
-        Returns two atomgroups, fore and aft
-            fore is all atoms connected to J
-            aft is all atoms connected to K
+        Returns two atomgroups, stator and and rotor
+            one atom group is all atoms connected to J
+            the other atomgroup  is all atoms connected to K
+            if fixed_atom is defined, stator is the atomgroup that contains fixed_atom, and rotor is the atomgroup that does not contain fixed_atom 
+            if fixed_atom is not defined, stator is the atomgroup that contains atom J, and rotor is the atomgroup that contains atom K 
+
         """
 
         pair = self.polymer.select_atoms(f'(resid {J_resid} and name {J}) or (resid {K_resid} and name {K})' ) 
@@ -271,13 +285,19 @@ class Polymer:
         g = nx.Graph()
         g.add_edges_from(self.polymer.atoms.bonds.to_indices()) 
         g.remove_edge(*bond.indices)
-        a, _ = (nx.subgraph(g,c) for c in nx.connected_components(g))
-        fore=self.polymer.atoms[a.nodes()]
-        aft=self.polymer.atoms ^ fore
-        return(fore,aft)
+        a, b = (nx.subgraph(g,c) for c in nx.connected_components(g))
+        if stator_selection:
+          fixed_atom = self.polymer.select_atoms(f'{stator_selection}' ).indices[0] 
+        else:
+          fixed_atom = self.polymer.select_atoms(f'(resid {J_resid} and name {J})' ).indices[0]
+
+        fixed = a if fixed_atom in a.nodes() else b
+        stator=self.polymer.atoms[fixed.nodes()]
+        rotor=self.polymer.atoms ^ stator
+        return(stator,rotor)
 
 
-    def rotate(self,J,J_resid,K,K_resid,mult=3,step=1):
+    def rotate(self,J,J_resid,K,K_resid,mult=3,step=1,stator_selection=None):
         """
         Given a pair of bonded atoms J and K within some torsion, uses _split_pol() to identify all atoms connected to J, then rotates them around vector JK by (step * int(360/mult)) degrees, rotating the dihedral centered over J-K by one step.  
 
@@ -295,15 +315,18 @@ class Polymer:
         :param step: how many steps to rotate around the torsion, where one step = 320/mult degrees, 
                 defaults to 3
         :type step: int, optional
+        :param stator_selection: selection string used to identify which half of the polymer moves.  The first atom that matches this selection string is identified.  When the polymer is rotated, the half containing that atom will be fixed, and the half not containing that atom will rotate.  If no selection is given, the fixed half of the polymer is the half containing atom J.
+        
         """
 
-        fore,_=self._split_pol(J,J_resid,K,K_resid)
+        self.invalidate_pca_cache()
+        stator,rotor=self._split_pol(J,J_resid,K,K_resid,stator_selection=stator_selection)
         pair = self.polymer.select_atoms(f'(resid {J_resid} and name {J}) or (resid {K_resid} and name {K})' ) 
         bond = self.polymer.atoms.bonds.atomgroup_intersection(pair,strict=True)[0]
-        v = bond[1].position - bond[0].position
-        o = (fore & bond.atoms)[0]
+        v = bond[0].position - bond[1].position
+        o = (rotor & bond.atoms)[0]
         rot = step * int(360/mult) # rotate by $step multiplicity units
-        fore.rotateby(rot, v, point=o.position)
+        rotor.rotateby(rot, v, point=o.position)
 
 
     def dist(self,J,J_resid,K,K_resid,dummies='X*',backwards_only=True):
@@ -379,6 +402,7 @@ class Polymer:
         :return: True if clash detected, or False if no clash detected
         :rtype: bool
         """
+        self.invalidate_pca_cache()
         step = random.randrange(1,mult) # rotate fore by a random multiplicity
         self.rotate(J,J_resid,K,K_resid,mult,step)
         clash= (self.dist(J,J_resid,K,K_resid,dummies,backwards_only=backwards_only) <= cutoff )
@@ -410,6 +434,8 @@ class Polymer:
                 resolved and no clashes detected
         :rtype: bool
         """
+        self.invalidate_pca_cache()
+
         steps=len(pairlist)
         tries={x:0 for x in range(0,steps)} # how many steps around the dihedral have we tried? resets to zero if you step backwards
         fails={x:0 for x in range(0,steps)} # how many times have we had to step backwards at this monomer?  the more times, the further back we step 
@@ -452,7 +478,8 @@ class Polymer:
             print('Perhaps you should try building a pseudolinear geometry with .extend(linearise=True) or randomising a subset of the dihedrals with shuffler(), and then try solving a conformation again')
             return True
         else:
-            return False
+            return False # TODO fix how I return validity.  right now it returns. "is invalid" which is a foolish thing to have done
+      
 
     def shuffler(self,pairlist,dummies='X*',cutoff=0.5,clashcheck=False):
         """
@@ -570,3 +597,438 @@ class Polymer:
 
         polyList[-1] = polyList[-1].split("_")[0] + 'T' # convert last monomer from middle to terminator -> add extra bit onto middle mono
         return(polyList) # list of length items with all monomers in order -> used to build w PDBs
+
+    # def PCA_coord(self,x,y,z,dummies="X*"):
+    #     """
+    #     Descibe the size and shape of a Polymer through principle component analysis.  
+        
+    #     First, uses PCA to determine the principle components of the atomic coordinates as three orthoganal eigenvectors.
+    #     If the molecule is translated such that the largest eigenvector lay along x, the second alrgest lay along y, and the third largest lay along z,
+    #     the molecule would be largest in the x dimension, and smallest in the y dimension.
+        
+        
+    #     """
+        
+    #     P=self.select_atoms(f'not name {dummies}').atoms.positions
+    #     centroid =     np.mean(P, axis=0)
+    #     P_origin = P - centroid
+    #     cov_matrix = np.cov(P_origin.T)
+    #     eigenvalues, eigenvectors = np.linalg.eigh(cov_matrix)
+ 
+    #     sort_indices = np.argsort(eigenvalues)[::-1]
+    #     eigenvalues = eigenvalues[sort_indices]
+    #     eigenvectors = eigenvectors[:, sort_indices]
+ 
+    #     axes = eigenvectors.T
+ 
+    #     dimensions = np.ptp(np.dot(P_origin, axes.T), axis=0)    
+ 
+    #     return dimensions, axes, centroid, eigenvalues,
+
+
+    # def boxify(self,x,y,z,dummies="X*"):
+    #   P=self.select_atoms(f'not name {dummies}').atoms.center_of_geometry()
+      
+    #   for coord in [0,1,2]:
+    #     size=self.select_atoms(f'not name {dummies}').atoms.positions[coord]
+    
+    def _compute_pca(self, dummies="X*"):
+        """
+        Internal method to compute PCA results.
+        """
+        P = self.select_atoms(f'not name {dummies}').atoms.positions
+        
+        centroid = np.mean(P, axis=0)
+        P_origin = P - centroid
+        
+        cov_matrix = np.cov(P_origin.T)
+        eigenvalues, eigenvectors = np.linalg.eigh(cov_matrix)
+        
+        sort_indices = np.argsort(eigenvalues)[::-1]
+        eigenvalues = eigenvalues[sort_indices]
+        eigenvectors = eigenvectors[:, sort_indices]
+        
+        axes = eigenvectors.T
+        dimensions = np.ptp(np.dot(P_origin, axes.T), axis=0)
+        
+        # Cache results
+        self._pca_dimensions = dimensions
+        self._pca_axes = axes
+        self._pca_centroid = centroid
+        self._pca_eigenvalues = eigenvalues
+        self._pca_dummies = dummies # we use this to force recalc is the definition of dummies has changed
+        self._pca_valid = True
+        
+        return dimensions, axes, centroid, eigenvalues
+    
+    def PCA_coord(self, x=None, y=None, z=None, dummies="X*", force_recalculate=False):
+        """
+        Describe the size and shape of a Polymer through principle component analysis.
+
+        First, uses PCA to determine the principle components of the atomic coordinates 
+        as three orthogonal eigenvectors.
+
+        If the molecule is translated such that the largest eigenvector lay along x, 
+        the second largest lay along y, and the third largest lay along z,
+        the molecule would be largest in the x dimension, and smallest in the z dimension.
+        
+        Parameters:
+        dummies : str, atomic names to exclude from calculation
+        force_recalculate : bool, if True, bypass cache and recalculate
+        
+        Returns:
+        tuple : (dimensions, axes, centroid, eigenvalues)
+        """
+        
+        # Check if we need to recalculate
+        need_recalc = (force_recalculate or 
+                      not self._pca_valid or 
+                      not hasattr(self, '_pca_dummies') or # consider edge cases why do we need to recalc if the PCA dummies are not defined? what if there are no dummies? 
+                      self._pca_dummies != dummies)
+        
+        if need_recalc:
+            return self._compute_pca(dummies)
+        else:
+            return self._pca_dimensions, self._pca_axes, self._pca_centroid, self._pca_eigenvalues
+
+    def invalidate_pca_cache(self):
+        """
+        Invalidate the PCA cache. Call this after any structural changes.
+        """
+        self._pca_valid = False
+
+    # can I rerite these as proerties? I probably need to resolve how I handle dummies because that's causing a lot of problems here TODO
+
+    def pca_dimensions(self, dummies="X*"):
+        """Get PCA dimensions, computing if necessary."""
+        self.PCA_coord(dummies=dummies)
+        return self._pca_dimensions
+    
+    def pca_axes(self, dummies="X*"):
+        """Get PCA axes, computing if necessary."""
+        self.PCA_coord(dummies=dummies)
+        return self._pca_axes
+    
+    def pca_centroid(self, dummies="X*"):
+        """Get PCA centroid, computing if necessary."""
+        self.PCA_coord(dummies=dummies)
+        return self._pca_centroid
+    
+    def pca_eigenvalues(self, dummies="X*"):
+        """Get PCA eigenvalues, computing if necessary."""
+        self.PCA_coord(dummies=dummies)
+        return self._pca_eigenvalues
+    
+    def _boxcheck(self,box_dimensions,dummies="X*"):
+        """ Check if the polymer fits inside a box of size dimensions """
+        dimensions=self.pca_dimensions()
+      
+        b_sorted = np.sort(box_dimensions)[::-1]
+        
+        return np.all(dimensions <= b_sorted)
+
+        """
+        Check if the polymer fits inside a box of size `box_dimensions`
+        Used before inserting the molecule into a box
+
+        :param box_dimensions: Box dimensions [x, y, z]
+        :type box_dimensions: array-like, shape (3,)
+        :param dummies: _the names of dummy atoms, to be discluded from the
+                distance calculation. Passed to :func:`shuffle`, defaults to 'X*'
+        :type dummies: str, optional
+        """     
+
+    def move_to_origin(self,dummies="X*"):
+        V = self.pca_centroid(dummies=dummies)
+        self.atoms.translate(-V)
+
+    def move_to_point(self,point,dummies="X*"):
+        V = self.pca_centroid(dummies=dummies)        
+        self.atoms.translate(point-V)
+
+
+    def boxify(self,box_dimensions,dummies="X*"):
+        """
+        Translate polymer to the center of a box of size `box_dimensions` centered at the origin
+        """
+        
+        # first check the polymer could ever fits inside the box
+        dim = self.pca_dimensions(dummies=dummies)        
+        PCA = self.pca_axes(dummies=dummies)
+
+        boxcheck=self._boxcheck(box_dimensions,dummies="X*")
+        if not boxcheck:
+            print( f"Polymer of size {dim} is too large to fix inside a box of size {box_dimensions}")
+            return False
+        self.move_to_origin(dummies=dummies)
+        
+        # next, order the box axes is largest
+          
+        #box matrix (unit vectors sorted by magnitude
+        B = np.eye(3)[:, np.argsort(box_dimensions)[::-1]]
+                
+        # rotation matrix to rotate object such that priniple axes are aligned to boxes axes in descending order
+        R = B @ PCA.T
+    
+        P = self.select_atoms(f"not name {dummies}").atoms.positions
+        self.select_atoms(f"not name {dummies}").atoms.positions = P @ R
+        return
+
+    def rotate_around_centroid(self,R=None,dummies="X*"):
+        if R is None:
+          R = np.eye(3)
+        
+        P = self.select_real_atoms(dummies=dummies).atoms.positions
+        C = self.pca_centroid(dummies=dummies)
+        self.select_real_atoms(dummies=dummies).atoms.positions = (R @ (P - C).T).T + C
+     
+
+    def boxify_random(self,box_dimensions,dummies="X*",tolerance=None,strict=True,attempts=20):
+        """
+        Translate polymer to the center of a box of size `box_dimensions` centered at the origin
+        """
+        
+        # tolerance:  how far does the center need to be from the edge of the box
+        # first check the polymer could ever fits inside the box
+        box_dimensions = np.array(box_dimensions)
+
+        dim = self.pca_dimensions(dummies=dummies)        
+
+        boxcheck=self._boxcheck(box_dimensions,dummies="X*")
+        if tolerance > min(box_dimensions)/2:
+            print("A tolerance of {tolerance} is larger than half the box length for a box of size {box_dimension}.  Ass such, there are no valid points where the center of the polymer is at least {tolerance} from any edge of the box.  Choose a larger tolerance.")
+            return
+        
+        if not boxcheck:
+            print( f"Polymer of size {dim} is too large to fix inside a box of size {box_dimensions}")
+            return False
+
+        radius = max(dim)/2
+        #print(radius,tolerance)
+        if (tolerance) and (tolerance < radius):
+            print(f'tolerance: {tolerance} is smaller than the polymer radius {radius}.')
+            if not strict:
+                print('This is risky, as you are likely to sample positions where some portion of the polymer lies outside the box.  You may wish to consider setting a larger tolerance')
+            if strict:
+                print('You have set strict=True.  Setting tolerance to {radius}')
+                tolerance=radius
+        if not tolerance:
+            tolerance=radius # if user does not provide a tolerance, use the polymer radius
+        valid=False
+        for _ in range(attempts): 
+  
+          # choose a random point that lies within a box, and is at least rolerance from the box edge
+          x_range,y_range,z_range = (box_dimensions/2)-tolerance
+          #print(box_dimensions,tolerance,'ranges',x_range,y_range,z_range)
+          rand_x=(random.randrange(-x_range,x_range))
+          rand_y=(random.randrange(-y_range,y_range))
+          rand_z=(random.randrange(-z_range,z_range))
+  
+          self.move_to_point(point=[rand_x,rand_y,rand_z],dummies=dummies)
+  
+          # generate a random rotation matrix
+          M = np.random.randn(3, 3)  
+          R, _ = np.linalg.qr(M)
+          if np.linalg.det(R) < 0:
+                R[:, 0] = -R[:, 0]
+  
+          self.rotate_around_centroid(R)
+          Q = self.select_real_atoms(dummies=dummies).atoms.positions
+          
+          if np.all(np.abs(Q) <=  box_dimensions / 2):
+                # All points fit inside the box - break the loop
+                self.select_real_atoms(dummies=dummies).atoms.positions = Q
+                valid=True
+                break
+          else:
+                print(f"Warning: Could not find a rotation that fits inside the box after {attempts} tries.")
+                
+        return(valid)
+
+    def select_real_atoms(self,dummies="X*",selection="all"):
+        return self.select_atoms(f'({selection}) and (not name {dummies})')
+
+
+
+
+    def dihedral_solver_shape(self,pairlist,dummies='X*',cutoff=0.7,backwards_only=True,box_dimensions=[100,100,100],stator_selection=None):
+        """
+        Converts the shuffled conformation (i.e. after :func:`shuffle`) into
+        one without overlapping atoms by resolving dihedrals
+
+        :param pairlist: list of dicts of atom pairs, created with
+                :func:`gen_pairlist`, e.g. [{J,J_resid,K,K_resid,mult}]
+        :type pairlist: list of dicts of atom pairs
+        :param dummies: the names of dummy atoms, to be discluded from the
+                distance calculation. Passed to :func:`dist`, defaults to 'X*'
+        :type dummies: str, optional
+        :param cutoff: maximum interatomic distance for atoms to be considered
+                overlapping, defaults to 0.7
+        :type cutoff: float, optional
+        :param backwards_only: passed to :func:`dist` to decide if clash
+                checking is done from residue 1 up to max([J_resid,K_resid]) for the current dihedral (if True),
+                or along the entire polymer (if False)
+                defaults to True
+        :type backwards_only: bool, optional
+
+        :return: True if unable to resolve dihedrals or False if dihedrals all
+                resolved and no clashes detected
+        :rtype: bool
+        """
+        self.invalidate_pca_cache()
+        box_dimensions = np.array(box_dimensions)
+  
+        steps=len(pairlist)
+        tries={x:0 for x in range(0,steps)} # how many steps around the dihedral have we tried? resets to zero if you step backwards
+        fails={x:0 for x in range(0,steps)} # how many times have we had to step backwards at this monomer?  the more times, the further back we step 
+        # TODO stepback isn't as exhaustive as I'd like it to be.   
+        i=0
+        failed=False
+        done=False
+        retry=False
+        repeats=0
+        while not (done) :
+            with tqdm(total=steps) as pbar:
+                while i < steps and i >=0:
+                    dh=pairlist[i]
+                    check=self.dist(J=dh['J'],J_resid=dh['J_resid'],K=dh['K'],K_resid=dh['K_resid'],dummies=dummies,backwards_only=backwards_only)
+                    stator,_ = self._split_pol(J=dh['J'],J_resid=dh['J_resid'],K=dh['K'],K_resid=dh['K_resid'],stator_selection=stator_selection)
+                    boxcheck = solver_sizecheck(stator,box_dimensions,dummies="X*")                                                                                         
+                    if check > cutoff and boxcheck and not retry :
+                        i+=1
+                        pbar.update(1)
+                    else:
+                        retry=False
+                        #print(i,'tries',tries[i],'multiplicity:',dh['mult'])
+                        if tries[i] >= dh['mult']: # have you tried all steps around the dihedral?
+                            if i==0: # yes, and this is the first monomer
+                                failed=True
+                                done=True
+                                i=-1 # force exit from while loops upon failure
+                            else: # yes, and this is not the first monomer
+                                #print(i,tries[i])
+                                retry=True
+                                tries[i] = 0 # reset tries for this monomer
+                                fails[i]+=1 # monomer has failed
+                                pbar.update(-(min(i,fails[i])))
+                                i= i-fails[i] # step backwards by number of failures
+                                repeats += 1
+                        else: # no, there are more tries
+                            tries[i] += 1
+                            self.rotate(J=dh['J'],J_resid=dh['J_resid'],K=dh['K'],K_resid=dh['K_resid'],mult=dh['mult'])
+                done=True
+        if failed or i<0: # hard coded to detect failure if you stop at i<=0 because detecting this automatically wasn't working
+            print('Could not reach a valid conformation')
+            print('Perhaps you should try building a pseudolinear geometry with .extend(linearise=True) or randomising a subset of the dihedrals with shuffler(), and then try solving a conformation again')
+            return True
+        else:
+            return False
+
+
+    def dihedral_solver_box(self,pairlist,dummies='X*',cutoff=0.7,backwards_only=True,box_dimensions=[100,100,100],stator_selection=None):
+        """
+        Converts the shuffled conformation (i.e. after :func:`shuffle`) into
+        one without overlapping atoms by resolving dihedrals
+
+        :param pairlist: list of dicts of atom pairs, created with
+                :func:`gen_pairlist`, e.g. [{J,J_resid,K,K_resid,mult}]
+        :type pairlist: list of dicts of atom pairs
+        :param dummies: the names of dummy atoms, to be discluded from the
+                distance calculation. Passed to :func:`dist`, defaults to 'X*'
+        :type dummies: str, optional
+        :param cutoff: maximum interatomic distance for atoms to be considered
+                overlapping, defaults to 0.7
+        :type cutoff: float, optional
+        :param backwards_only: passed to :func:`dist` to decide if clash
+                checking is done from residue 1 up to max([J_resid,K_resid]) for the current dihedral (if True),
+                or along the entire polymer (if False)
+                defaults to True
+        :type backwards_only: bool, optional
+
+        :return: True if unable to resolve dihedrals or False if dihedrals all
+                resolved and no clashes detected
+        :rtype: bool
+        """
+        self.invalidate_pca_cache()
+        box_dimensions = np.array(box_dimensions)
+  
+        steps=len(pairlist)
+        tries={x:0 for x in range(0,steps)} # how many steps around the dihedral have we tried? resets to zero if you step backwards
+        fails={x:0 for x in range(0,steps)} # how many times have we had to step backwards at this monomer?  the more times, the further back we step 
+        # TODO stepback isn't as exhaustive as I'd like it to be.   
+        i=0
+        failed=False
+        done=False
+        retry=False
+        repeats=0
+        while not (done) :
+            with tqdm(total=steps) as pbar:
+                while i < steps and i >=0:
+                    dh=pairlist[i]
+                    check=self.dist(J=dh['J'],J_resid=dh['J_resid'],K=dh['K'],K_resid=dh['K_resid'],dummies=dummies,backwards_only=backwards_only)
+                    stator,_ = self._split_pol(J=dh['J'],J_resid=dh['J_resid'],K=dh['K'],K_resid=dh['K_resid'],stator_selection=stator_selection)
+                    boxcheck = solver_boxcheck(stator,box_dimensions,dummies="X*")                                                                                         
+                    if check > cutoff and boxcheck and not retry :
+                        i+=1
+                        pbar.update(1)
+                    else:
+                        retry=False
+                        #print(i,'tries',tries[i],'multiplicity:',dh['mult'])
+                        if tries[i] >= dh['mult']: # have you tried all steps around the dihedral?
+                            if i==0: # yes, and this is the first monomer
+                                failed=True
+                                done=True
+                                i=-1 # force exit from while loops upon failure
+                            else: # yes, and this is not the first monomer
+                                #print(i,tries[i])
+                                retry=True
+                                tries[i] = 0 # reset tries for this monomer
+                                fails[i]+=1 # monomer has failed
+                                pbar.update(-(min(i,fails[i])))
+                                i= i-fails[i] # step backwards by number of failures
+                                repeats += 1
+                        else: # no, there are more tries
+                            tries[i] += 1
+                            self.rotate(J=dh['J'],J_resid=dh['J_resid'],K=dh['K'],K_resid=dh['K_resid'],mult=dh['mult'])
+                done=True
+        if failed or i<0: # hard coded to detect failure if you stop at i<=0 because detecting this automatically wasn't working
+            print('Could not reach a valid conformation')
+            print('Perhaps you should try building a pseudolinear geometry with .extend(linearise=True) or randomising a subset of the dihedrals with shuffler(), and then try solving a conformation again')
+            return True
+        else:
+            return False
+
+
+def compute_pca_subset(subset,dummies="X*"):
+        """
+        Internal method to compute PCA results.
+        """
+        P = subset.select_atoms(f'not name {dummies}').atoms.positions
+        
+        centroid = np.mean(P, axis=0)
+        P_origin = P - centroid
+        
+        cov_matrix = np.cov(P_origin.T)
+        eigenvalues, eigenvectors = np.linalg.eigh(cov_matrix)
+        
+        sort_indices = np.argsort(eigenvalues)[::-1]
+        eigenvalues = eigenvalues[sort_indices]
+        eigenvectors = eigenvectors[:, sort_indices]
+        
+        axes = eigenvectors.T
+        dimensions = np.ptp(np.dot(P_origin, axes.T), axis=0)
+        
+        return dimensions, axes, centroid, eigenvalues
+
+def solver_sizecheck(stator,box_dimensions,dummies="X*"):
+    limits=np.argsort(box_dimensions)[::-1]
+    stator_dims,_,_,_ = compute_pca_subset(stator,dummies=dummies)
+    return( np.all(stator_dims <=  limits ))
+
+def solver_boxcheck(stator,box_dimensions,dummies="X*"):
+    limits=box_dimensions / 2
+    P = stator.select_atoms(f'not name {dummies}').atoms.positions
+    return (np.all(np.abs(P) <= limits ))
+
+
+# TODO all the box stuff seems to be fitting into boxes much larger than I expected

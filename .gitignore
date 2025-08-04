@@ -150,3 +150,7 @@ polytop_examples/data/pei_linear_polymer.*
 # OS X nonsense
 
 .DS_store
+
+# dev stuff
+
+*.ignore
