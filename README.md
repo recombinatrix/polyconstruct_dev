@@ -21,6 +21,27 @@ Detailed documentation is available at the [PolyConstruct ReadTheDocs](https://p
 
 There is a series of detailed tutorials for *PolyConf* in the folder [polyconf_examples](https://github.com/OMaraLab/polyconstruct/tree/main/polyconf_examples), and for *PolyTop* in the folder [polytop_examples](https://github.com/OMaraLab/polyconstruct/tree/main/polytop_examples).  A set of example input and output files for *PolyBuild* are presented in the folder [polybuild_examples/RTP_entries](https://github.com/OMaraLab/polyconstruct/tree/main/polybuild_examples/RTP_entries)
 
+## Quick and dirty installation of the constraints fork of polyconstruct_flat
+
+This fork contains a pre alpha build of polyconstruct that adds additional restraints to the dihedral solver algoriths, which let you build polymers within specified dimensions (eg, a long flat box)
+
+This is experimental; use with caution.
+
+If you have not spoken to Ada personally, you are not licenced to use this fork for any purpose.  
+
+Install the experimental branch like so
+
+```bash
+cd ~
+git clone --branch constraints git@github.com:recombinatrix/polyconstruct_dev.git
+cd polyconstruct_dev
+conda create --name polyconstruct_flat python=3.10
+conda activate polyconstruct_flat
+pip install -r requirements.txt
+cd polyconf
+pip install -e .
+```
+
 ## Quick and dirty installation
 
 From your home directory, clone *PolyConstruct* from this repository:
